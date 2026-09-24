@@ -6,6 +6,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 use tauri::Manager;
+use base64::Engine;
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_FILES: usize = 10_000;
@@ -19,6 +20,103 @@ const SKIP_DIRS: &[&str] = &[
     ".next",
     "coverage",
 ];
+const EVIDENCE_SCHEMA_VERSION: u32 = 1;
+const VISION_MODEL: &str = "gpt-4o-mini";
+const ANALYSIS_PROMPT: &str = "Describe only observable screenshot evidence. Identify screen/tool if observable; project area; concise visible state; useful visible text; notable elements; possible purposes and story relevance as topics only. Do not infer history, chronology, causes, developer intentions, or unseen implementation. Avoid tiny labels. Use unknown when uncertain. Return JSON matching the supplied schema.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScreenshotEvidence {
+    schema_version: u32, id: String, source_id: String, file_path: String,
+    file_size: u64, modified_at: Option<String>, analysed_at: String,
+    description: String, content_type: String, project_area: Option<String>,
+    visible_text: Vec<String>, notable_elements: Vec<String>, possible_purpose: Vec<String>,
+    possible_story_relevance: Vec<String>, confidence: f32,
+    model: ModelInfo,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelInfo { provider: String, model: String }
+#[derive(Debug, Serialize, Deserialize)]
+struct EvidenceStore { schema_version: u32, records: Vec<ScreenshotEvidence> }
+#[derive(Debug, Deserialize)]
+struct ProviderEvidence { description: String, content_type: String, project_area: Option<String>, visible_text: Vec<String>, notable_elements: Vec<String>, possible_purpose: Vec<String>, possible_story_relevance: Vec<String>, confidence: f32 }
+
+fn evidence_path(app: &tauri::AppHandle, workspace_id: &str) -> Result<PathBuf, String> {
+    Ok(app.path().app_data_dir().map_err(|e| e.to_string())?.join("evidence").join(format!("{workspace_id}.json")))
+}
+fn load_evidence_at(path: &Path) -> Result<Vec<ScreenshotEvidence>, String> {
+    if !path.exists() { return Ok(vec![]); }
+    let raw = fs::read(path).map_err(|e| format!("Cannot read screenshot evidence: {e}"))?;
+    let store: EvidenceStore = serde_json::from_slice(&raw).map_err(|e| format!("Screenshot evidence is malformed: {e}"))?;
+    if store.schema_version != EVIDENCE_SCHEMA_VERSION { return Err("Screenshot evidence has an unsupported schema version".into()); }
+    for record in &store.records { validate_evidence(record)?; }
+    Ok(store.records)
+}
+fn valid_content_type(value: &str) -> bool {
+    ["application_ui", "website", "code", "terminal", "development_tool", "design", "error", "documentation", "mixed", "unknown"].contains(&value)
+}
+fn validate_evidence(e: &ScreenshotEvidence) -> Result<(), String> {
+    if e.schema_version != EVIDENCE_SCHEMA_VERSION || e.id.is_empty() || e.source_id.is_empty() || e.file_path.is_empty() || e.description.trim().is_empty() || !valid_content_type(&e.content_type) || !(0.0..=1.0).contains(&e.confidence) || e.model.provider != "OpenAI" || e.model.model.is_empty() {
+        return Err("The visual analysis response did not match the screenshot evidence schema. Retry this screenshot.".into());
+    }
+    for values in [&e.visible_text, &e.notable_elements, &e.possible_purpose, &e.possible_story_relevance] {
+        if values.len() > 30 || values.iter().any(|v| v.trim().is_empty() || v.len() > 500) { return Err("The visual analysis response contained invalid list items. Retry this screenshot.".into()); }
+    }
+    Ok(())
+}
+#[cfg(test)]
+fn evidence_matches_identity(e: &ScreenshotEvidence, size: u64, modified_at: &Option<String>) -> bool {
+    e.file_size == size && &e.modified_at == modified_at
+}
+fn file_identity(path: &Path) -> Result<(u64, Option<String>), String> {
+    let m = fs::metadata(path).map_err(|e| format!("Cannot read screenshot metadata: {e}"))?;
+    Ok((m.len(), modified(path)))
+}
+
+#[tauri::command]
+fn load_screenshot_evidence(app: tauri::AppHandle, workspace_id: String) -> Result<Vec<ScreenshotEvidence>, String> {
+    load_evidence_at(&evidence_path(&app, &workspace_id)?)
+}
+
+#[tauri::command]
+fn screenshot_preview(path: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let mime = match ext.as_str() { "png" => "image/png", "jpg"|"jpeg" => "image/jpeg", "webp" => "image/webp", _ => return Err("Unsupported screenshot format".into()) };
+    let bytes = fs::read(p).map_err(|e| format!("Cannot open screenshot preview: {e}"))?;
+    if bytes.len() > 20 * 1024 * 1024 { return Err("Screenshot is too large to preview (20 MB limit).".into()); }
+    Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+#[tauri::command]
+fn analyse_screenshot(app: tauri::AppHandle, workspace_id: String, source_id: String, path: String) -> Result<ScreenshotEvidence, String> {
+    let key = std::env::var("BUILDLORE_OPENAI_API_KEY").map_err(|_| "OpenAI credential missing. Set BUILDLORE_OPENAI_API_KEY for the BuildLore process, then restart BuildLore.".to_string())?;
+    let p = Path::new(&path);
+    let (file_size, modified_at) = file_identity(p)?;
+    if file_size > 20 * 1024 * 1024 { return Err("Screenshot exceeds the 20 MB analysis limit.".into()); }
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let mime = match ext.as_str() { "png" => "image/png", "jpg"|"jpeg" => "image/jpeg", "webp" => "image/webp", _ => return Err("Unsupported screenshot format".into()) };
+    let bytes = fs::read(p).map_err(|e| format!("Cannot read screenshot: {e}"))?;
+    let data = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+    let schema = serde_json::json!({"type":"object","additionalProperties":false,"properties":{
+      "description":{"type":"string"},"content_type":{"type":"string","enum":["application_ui","website","code","terminal","development_tool","design","error","documentation","mixed","unknown"]},
+      "project_area":{"type":["string","null"]},"visible_text":{"type":"array","items":{"type":"string"}},"notable_elements":{"type":"array","items":{"type":"string"}},"possible_purpose":{"type":"array","items":{"type":"string"}},"possible_story_relevance":{"type":"array","items":{"type":"string"}},"confidence":{"type":"number"}},
+      "required":["description","content_type","project_area","visible_text","notable_elements","possible_purpose","possible_story_relevance","confidence"]});
+    let body = serde_json::json!({"model":VISION_MODEL,"input":[{"role":"user","content":[{"type":"input_text","text":ANALYSIS_PROMPT},{"type":"input_image","image_url":data}]}],"text":{"format":{"type":"json_schema","name":"screenshot_evidence","strict":true,"schema":schema}}});
+    let response: serde_json::Value = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(90)).build().map_err(|e| format!("Cannot initialize vision provider: {e}"))?.post("https://api.openai.com/v1/responses").bearer_auth(key).json(&body).send().map_err(|e| format!("OpenAI request failed: {e}"))?.error_for_status().map_err(|e| format!("OpenAI rejected the request: {e}"))?.json().map_err(|e| format!("OpenAI returned invalid JSON: {e}"))?;
+    let text = response["output"].as_array().and_then(|a| a.iter().flat_map(|v| v["content"].as_array().into_iter().flatten()).find_map(|c| c["text"].as_str())).ok_or("OpenAI response did not include structured evidence")?;
+    let parsed: ProviderEvidence = serde_json::from_str(text).map_err(|_| "OpenAI returned malformed or incomplete evidence. Retry this screenshot.".to_string())?;
+    let evidence = ScreenshotEvidence { schema_version: EVIDENCE_SCHEMA_VERSION, id: id(), source_id, file_path: path,
+      file_size, modified_at, analysed_at: now(), description: parsed.description, content_type: parsed.content_type, project_area: parsed.project_area,
+      visible_text: parsed.visible_text, notable_elements: parsed.notable_elements, possible_purpose: parsed.possible_purpose,
+      possible_story_relevance: parsed.possible_story_relevance, confidence: parsed.confidence, model: ModelInfo { provider: "OpenAI".into(), model: VISION_MODEL.into() } };
+    validate_evidence(&evidence)?;
+    let store_path = evidence_path(&app, &workspace_id)?;
+    let mut records = load_evidence_at(&store_path)?;
+    records.retain(|r| !(r.source_id == evidence.source_id && r.file_path == evidence.file_path));
+    records.push(evidence.clone());
+    write_json_atomic(&store_path, &EvidenceStore { schema_version: EVIDENCE_SCHEMA_VERSION, records })?;
+    Ok(evidence)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -405,7 +503,10 @@ pub fn run() {
             load_recent,
             create_workspace,
             add_source,
-            scan_sources
+            scan_sources,
+            load_screenshot_evidence,
+            screenshot_preview,
+            analyse_screenshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running BuildLore");
@@ -414,6 +515,37 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sample_evidence() -> ScreenshotEvidence {
+        ScreenshotEvidence { schema_version: 1, id: "e1".into(), source_id: "s1".into(), file_path: "C:/shot.png".into(), file_size: 5, modified_at: Some("2026-01-01T00:00:00+00:00".into()), analysed_at: now(), description: "A settings screen".into(), content_type: "application_ui".into(), project_area: None, visible_text: vec!["Settings".into()], notable_elements: vec![], possible_purpose: vec![], possible_story_relevance: vec![], confidence: 0.9, model: ModelInfo { provider: "OpenAI".into(), model: VISION_MODEL.into() } }
+    }
+    #[test]
+    fn evidence_schema_validation_accepts_valid_and_rejects_invalid() {
+        let e = sample_evidence(); assert!(validate_evidence(&e).is_ok());
+        let mut invalid = e; invalid.content_type = "event".into(); assert!(validate_evidence(&invalid).is_err());
+    }
+    #[test]
+    fn provider_response_is_normalized_only_when_complete() {
+        let response = r#"{"description":"Settings screen","content_type":"application_ui","project_area":null,"visible_text":["Settings"],"notable_elements":[],"possible_purpose":[],"possible_story_relevance":[],"confidence":0.8}"#;
+        assert!(serde_json::from_str::<ProviderEvidence>(response).is_ok());
+        assert!(serde_json::from_str::<ProviderEvidence>(r#"{"description":"missing required fields"}"#).is_err());
+    }
+    #[test]
+    fn evidence_identity_preserves_unchanged_and_stales_changed_file() {
+        let e = sample_evidence();
+        assert!(evidence_matches_identity(&e, 5, &e.modified_at));
+        assert!(!evidence_matches_identity(&e, 6, &e.modified_at));
+        assert!(!evidence_matches_identity(&e, 5, &Some("later".into())));
+    }
+    #[test]
+    fn evidence_store_round_trips_and_rejects_malformed_data() {
+        let path = std::env::temp_dir().join(format!("buildlore-evidence-{}.json", id()));
+        let store = EvidenceStore { schema_version: 1, records: vec![sample_evidence()] };
+        write_json_atomic(&path, &store).unwrap();
+        assert_eq!(load_evidence_at(&path).unwrap().len(), 1);
+        fs::write(&path, b"broken").unwrap();
+        assert!(load_evidence_at(&path).unwrap_err().contains("malformed"));
+        let _ = fs::remove_file(path);
+    }
     #[test]
     fn extension_recognition_is_case_insensitive() {
         assert!(recognised(
