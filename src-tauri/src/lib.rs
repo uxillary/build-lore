@@ -21,7 +21,9 @@ const SKIP_DIRS: &[&str] = &[
     "coverage",
 ];
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
-const VISION_MODEL: &str = "gpt-4o-mini";
+const VISION_MODEL: &str = "gpt-5-mini";
+const CREDENTIAL_SERVICE: &str = "BuildLore";
+const CREDENTIAL_ACCOUNT: &str = "openai-api-key";
 const ANALYSIS_PROMPT: &str = "Describe only observable screenshot evidence. Identify screen/tool if observable; project area; concise visible state; useful visible text; notable elements; possible purposes and story relevance as topics only. Do not infer history, chronology, causes, developer intentions, or unseen implementation. Avoid tiny labels. Use unknown when uncertain. Return JSON matching the supplied schema.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +44,62 @@ struct ProviderEvidence { description: String, content_type: String, project_are
 
 fn evidence_path(app: &tauri::AppHandle, workspace_id: &str) -> Result<PathBuf, String> {
     Ok(app.path().app_data_dir().map_err(|e| e.to_string())?.join("evidence").join(format!("{workspace_id}.json")))
+}
+fn stored_credential() -> Result<Option<String>, String> {
+    match keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT).map_err(|_| "Could not access Windows Credential Manager.".to_string())?.get_password() {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(_) => Ok(None),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err("Could not access Windows Credential Manager.".into()),
+    }
+}
+fn credential_override(env_key: Option<String>, stored: Option<String>) -> Option<String> {
+    env_key.filter(|value| !value.trim().is_empty()).or(stored)
+}
+fn resolve_credential() -> Result<Option<String>, String> {
+    if let Ok(env_key) = std::env::var("BUILDLORE_OPENAI_API_KEY") {
+        if !env_key.trim().is_empty() { return Ok(credential_override(Some(env_key), None)); }
+    }
+    stored_credential().map(|stored| credential_override(None, stored))
+}
+
+#[tauri::command]
+fn provider_status() -> Result<String, String> {
+    Ok(if resolve_credential()?.is_some() { "configured" } else { "not_configured" }.into())
+}
+#[tauri::command]
+fn save_openai_key(api_key: String) -> Result<(), String> {
+    let key = api_key.trim();
+    if key.is_empty() { return Err("Enter an API key before saving.".into()); }
+    keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT).map_err(|_| "Could not access Windows Credential Manager.".to_string())?
+        .set_password(key).map_err(|_| "Could not save the key in Windows Credential Manager.".to_string())
+}
+#[tauri::command]
+fn remove_openai_key() -> Result<(), String> {
+    match keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT).map_err(|_| "Could not access Windows Credential Manager.".to_string())?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("Could not remove the key from Windows Credential Manager.".into()),
+    }
+}
+
+fn provider_error(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        401 | 403 => "OpenAI rejected this API key. Check it in Settings or replace it.".into(),
+        429 => "OpenAI could not process the request because of quota, billing, or rate limits. Check your OpenAI API billing and limits.".into(),
+        400 | 404 => "OpenAI could not process this screenshot request. Check model access and try again.".into(),
+        _ if status.is_server_error() => "OpenAI is temporarily unavailable. Try again later.".into(),
+        _ => "OpenAI could not process the screenshot request. Try again.".into(),
+    }
+}
+fn extract_provider_text(response: &serde_json::Value) -> Result<&str, String> {
+    response["output"].as_array().and_then(|a| a.iter().flat_map(|v| v["content"].as_array().into_iter().flatten()).find_map(|c| c["text"].as_str()))
+        .ok_or_else(|| "OpenAI returned an unsupported response. Retry this screenshot.".into())
+}
+fn request_provider(client: &reqwest::blocking::Client, endpoint: &str, key: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let response = client.post(endpoint).bearer_auth(key).json(body).send()
+        .map_err(|_| "Could not reach OpenAI. Check your internet connection and try again.".to_string())?;
+    if !response.status().is_success() { return Err(provider_error(response.status())); }
+    response.json().map_err(|_| "OpenAI returned an invalid response. Retry this screenshot.".to_string())
 }
 fn load_evidence_at(path: &Path) -> Result<Vec<ScreenshotEvidence>, String> {
     if !path.exists() { return Ok(vec![]); }
@@ -89,7 +147,7 @@ fn screenshot_preview(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn analyse_screenshot(app: tauri::AppHandle, workspace_id: String, source_id: String, path: String) -> Result<ScreenshotEvidence, String> {
-    let key = std::env::var("BUILDLORE_OPENAI_API_KEY").map_err(|_| "OpenAI credential missing. Set BUILDLORE_OPENAI_API_KEY for the BuildLore process, then restart BuildLore.".to_string())?;
+    let key = resolve_credential()?.ok_or_else(|| "OpenAI isn't configured yet. Add an API key in Settings to analyse screenshots.".to_string())?;
     let p = Path::new(&path);
     let (file_size, modified_at) = file_identity(p)?;
     if file_size > 20 * 1024 * 1024 { return Err("Screenshot exceeds the 20 MB analysis limit.".into()); }
@@ -102,8 +160,9 @@ fn analyse_screenshot(app: tauri::AppHandle, workspace_id: String, source_id: St
       "project_area":{"type":["string","null"]},"visible_text":{"type":"array","items":{"type":"string"}},"notable_elements":{"type":"array","items":{"type":"string"}},"possible_purpose":{"type":"array","items":{"type":"string"}},"possible_story_relevance":{"type":"array","items":{"type":"string"}},"confidence":{"type":"number"}},
       "required":["description","content_type","project_area","visible_text","notable_elements","possible_purpose","possible_story_relevance","confidence"]});
     let body = serde_json::json!({"model":VISION_MODEL,"input":[{"role":"user","content":[{"type":"input_text","text":ANALYSIS_PROMPT},{"type":"input_image","image_url":data}]}],"text":{"format":{"type":"json_schema","name":"screenshot_evidence","strict":true,"schema":schema}}});
-    let response: serde_json::Value = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(90)).build().map_err(|e| format!("Cannot initialize vision provider: {e}"))?.post("https://api.openai.com/v1/responses").bearer_auth(key).json(&body).send().map_err(|e| format!("OpenAI request failed: {e}"))?.error_for_status().map_err(|e| format!("OpenAI rejected the request: {e}"))?.json().map_err(|e| format!("OpenAI returned invalid JSON: {e}"))?;
-    let text = response["output"].as_array().and_then(|a| a.iter().flat_map(|v| v["content"].as_array().into_iter().flatten()).find_map(|c| c["text"].as_str())).ok_or("OpenAI response did not include structured evidence")?;
+    let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(90)).build().map_err(|_| "Could not initialize the OpenAI connection.".to_string())?;
+    let response = request_provider(&client, "https://api.openai.com/v1/responses", &key, &body)?;
+    let text = extract_provider_text(&response)?;
     let parsed: ProviderEvidence = serde_json::from_str(text).map_err(|_| "OpenAI returned malformed or incomplete evidence. Retry this screenshot.".to_string())?;
     let evidence = ScreenshotEvidence { schema_version: EVIDENCE_SCHEMA_VERSION, id: id(), source_id, file_path: path,
       file_size, modified_at, analysed_at: now(), description: parsed.description, content_type: parsed.content_type, project_area: parsed.project_area,
@@ -506,7 +565,10 @@ pub fn run() {
             scan_sources,
             load_screenshot_evidence,
             screenshot_preview,
-            analyse_screenshot
+            analyse_screenshot,
+            provider_status,
+            save_openai_key,
+            remove_openai_key
         ])
         .run(tauri::generate_context!())
         .expect("error while running BuildLore");
@@ -528,6 +590,49 @@ mod tests {
         let response = r#"{"description":"Settings screen","content_type":"application_ui","project_area":null,"visible_text":["Settings"],"notable_elements":[],"possible_purpose":[],"possible_story_relevance":[],"confidence":0.8}"#;
         assert!(serde_json::from_str::<ProviderEvidence>(response).is_ok());
         assert!(serde_json::from_str::<ProviderEvidence>(r#"{"description":"missing required fields"}"#).is_err());
+        assert!(extract_provider_text(&serde_json::json!({"output":[]})).is_err());
+        assert!(extract_provider_text(&serde_json::json!({"output":[{"content":[{"type":"refusal"}]}]})).is_err());
+    }
+    #[test]
+    fn credentials_resolve_override_then_store_then_absent() {
+        assert_eq!(credential_override(None, None), None);
+        assert_eq!(credential_override(None, Some("stored-key".into())), Some("stored-key".into()));
+        assert_eq!(credential_override(Some("override-key".into()), Some("stored-key".into())), Some("override-key".into()));
+        assert_eq!(credential_override(Some("  ".into()), Some("stored-key".into())), Some("stored-key".into()));
+    }
+    #[test]
+    fn api_key_is_not_written_to_workspace_or_evidence_json() {
+        let sentinel = "secret-test-key-never-persist";
+        let workspace = Workspace { schema_version: SCHEMA_VERSION, id: "x".into(), name: "Project".into(), project_path: "C:/project".into(), created_at: now(), updated_at: now(), sources: vec![] };
+        let evidence = EvidenceStore { schema_version: 1, records: vec![sample_evidence()] };
+        assert!(!String::from_utf8(serde_json::to_vec(&workspace).unwrap()).unwrap().contains(sentinel));
+        assert!(!String::from_utf8(serde_json::to_vec(&evidence).unwrap()).unwrap().contains(sentinel));
+        assert!(!provider_error(reqwest::StatusCode::UNAUTHORIZED).contains(sentinel));
+    }
+    #[test]
+    fn provider_http_errors_are_safe_and_actionable() {
+        assert!(provider_error(reqwest::StatusCode::UNAUTHORIZED).contains("API key"));
+        assert!(provider_error(reqwest::StatusCode::TOO_MANY_REQUESTS).contains("billing"));
+        assert!(provider_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR).contains("temporarily unavailable"));
+    }
+    #[test]
+    fn provider_request_uses_a_mock_and_sanitizes_http_bodies() {
+        use std::{io::{Read, Write}, net::TcpListener, thread};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let body = r#"{"error":{"message":"secret-test-key-never-log"}}"#;
+            write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let client = reqwest::blocking::Client::new();
+        let result = request_provider(&client, &format!("http://{address}/v1/responses"), "secret-test-key-never-log", &serde_json::json!({"model": VISION_MODEL}));
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("API key"));
+        assert!(!error.contains("secret-test-key-never-log"));
     }
     #[test]
     fn evidence_identity_preserves_unchanged_and_stales_changed_file() {

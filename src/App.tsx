@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { BuildLoreWorkspace, ScreenshotEvidence, SourceType } from "./types";
@@ -12,7 +12,11 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [ready, setReady] = useState(false);
-  const [view, setView] = useState<"workspace" | "screenshots">("workspace");
+  const [view, setView] = useState<"workspace" | "screenshots" | "settings">("workspace");
+  const [providerStatus, setProviderStatus] = useState<"configured" | "not_configured" | "request_failed" | "error">("not_configured");
+  const [apiKey, setApiKey] = useState("");
+  const [settingsMessage, setSettingsMessage] = useState("");
+  const [missingProvider, setMissingProvider] = useState(false);
   const [evidence, setEvidence] = useState<ScreenshotEvidence[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [preview, setPreview] = useState("");
@@ -23,7 +27,13 @@ export default function App() {
   useEffect(() => {
     if (!isDesktop) { setReady(true); return; }
     invoke<BuildLoreWorkspace | null>("load_recent").then(async (w) => { setWorkspace(w); if (w) setEvidence(await invoke("load_screenshot_evidence", { workspaceId: w.id })); }).catch((e) => setError(String(e))).finally(() => setReady(true));
+    void refreshProviderStatus();
   }, []);
+
+  async function refreshProviderStatus() {
+    try { setProviderStatus(await invoke<"configured" | "not_configured">("provider_status")); }
+    catch { setProviderStatus("error"); }
+  }
 
   useEffect(() => { if (!workspace) return; invoke<ScreenshotEvidence[]>("load_screenshot_evidence", { workspaceId: workspace.id }).then(setEvidence).catch((e) => setError(String(e))); }, [workspace?.id]);
   useEffect(() => { if (!selectedPath) { setPreview(""); return; } invoke<string>("screenshot_preview", { path: selectedPath }).then(setPreview).catch(() => setPreview("")); }, [selectedPath]);
@@ -62,8 +72,13 @@ export default function App() {
   const stale = (file: typeof screenshots[number], item?: ScreenshotEvidence) => Boolean(item && (item.file_size !== file.size_bytes || item.modified_at !== file.modified_at));
   async function analyse(files: typeof screenshots) {
     if (!workspace || files.length === 0) return;
+    let status: "configured" | "not_configured";
+    try { status = await invoke<"configured" | "not_configured">("provider_status"); setProviderStatus(status); }
+    catch { setProviderStatus("error"); status = "not_configured"; }
+    if (status !== "configured") { setMissingProvider(true); return; }
+    setMissingProvider(false);
     const names = files.slice(0, 4).map((f) => f.name).join(", ");
-    if (!window.confirm(`The selected screenshot${files.length === 1 ? "" : "s"} will be sent to OpenAI (${files.length > 4 ? `${names}, and ${files.length - 4} more` : names}) for visual analysis. Continue?`)) return;
+    if (!window.confirm(`The selected screenshot${files.length === 1 ? "" : "s"} will be sent to OpenAI (${files.length > 4 ? `${names}, and ${files.length - 4} more` : names}) for visual analysis. No other project files are included. Continue?`)) return;
     cancelQueue.current = false; setAnalysisStates((prev) => ({ ...prev, ...Object.fromEntries(files.map((f) => [f.path, "queued"])) })); setProgress({ done: 0, total: files.length, current: "" });
     for (let i = 0; i < files.length; i++) {
       if (cancelQueue.current) { setAnalysisStates((prev) => Object.fromEntries(Object.entries(prev).filter(([path]) => !files.slice(i).some((f) => f.path === path)))); break; }
@@ -73,16 +88,28 @@ export default function App() {
         const item = await invoke<ScreenshotEvidence>("analyse_screenshot", { workspaceId: workspace.id, sourceId: file.sourceId, path: file.path });
         setEvidence((prev) => [...prev.filter((e) => !(e.source_id === item.source_id && e.file_path === item.file_path)), item]);
         setAnalysisStates((prev) => { const next = { ...prev }; delete next[file.path]; return next; });
-      } catch (e) { setAnalysisStates((prev) => ({ ...prev, [file.path]: "failed" })); setError(`${file.name}: ${String(e)}`); }
+      } catch (e) { setProviderStatus("request_failed"); setAnalysisStates((prev) => ({ ...prev, [file.path]: "failed" })); setError(`${file.name}: ${String(e)}`); }
       setProgress({ done: i + 1, total: files.length, current: "" });
     }
     setProgress(null);
   }
 
+  async function saveKey(event: FormEvent) {
+    event.preventDefault(); setSettingsMessage("");
+    try { await invoke("save_openai_key", { apiKey }); setApiKey(""); setSettingsMessage("API key saved securely."); await refreshProviderStatus(); }
+    catch (e) { setSettingsMessage(String(e)); }
+  }
+  async function removeKey() {
+    setSettingsMessage("");
+    try { await invoke("remove_openai_key"); setSettingsMessage("Saved API key removed."); await refreshProviderStatus(); }
+    catch (e) { setSettingsMessage(String(e)); }
+  }
+
   if (!ready) return <main className="shell"><p className="muted">Opening your workspace…</p></main>;
 
   return <main className="shell">
-    <header className="topbar"><a className="wordmark" href="#" aria-label="BuildLore home"><span className="mark">b</span> buildlore</a><span className="local"><i /> LOCAL WORKSPACE</span></header>
+    <header className="topbar"><a className="wordmark" href="#" aria-label="BuildLore home"><span className="mark">b</span> buildlore</a><div className="top-actions"><button className="quiet settings-link" onClick={() => setView("settings")}>Settings</button><span className="local"><i /> LOCAL WORKSPACE</span></div></header>
+    {view === "settings" ? <section className="settings-page"><div className="section-heading"><div><p className="eyebrow">PREFERENCES</p><h2>Settings</h2></div><button className="quiet" onClick={() => setView(workspace ? "workspace" : "screenshots")}>Done</button></div><section className="settings-section"><p className="eyebrow">AI PROVIDER</p><h3>OpenAI</h3><p className="provider-status">Status <strong data-state={providerStatus === "request_failed" ? "error" : providerStatus}>{providerStatus === "request_failed" ? "Request failed" : providerStatus === "configured" ? "Configured" : providerStatus === "error" ? "Error" : "Not configured"}</strong></p><p className="settings-help">API key <span>{providerStatus === "configured" || providerStatus === "request_failed" ? "••••••••••••••••" : "Not saved"}</span></p><form onSubmit={(e) => void saveKey(e)}><label className="sr-only" htmlFor="openai-key">API key</label><input id="openai-key" type="password" autoComplete="new-password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={providerStatus === "configured" || providerStatus === "request_failed" ? "Enter a replacement key" : "Paste your OpenAI API key"}/><div className="key-actions"><button className="primary" type="submit" disabled={!apiKey.trim()}>Save key</button><button className="text-action" type="button" disabled={providerStatus === "not_configured" || providerStatus === "error"} onClick={() => void removeKey()}>Remove saved key</button></div></form><p className="settings-help">The key is stored in Windows Credential Manager. Saving it never sends a screenshot. BuildLore sends only a screenshot you explicitly choose to analyse after confirmation.</p><p className="settings-help">A developer environment override takes precedence over this saved key.</p>{settingsMessage && <p className="settings-message" role="status">{settingsMessage}</p>}</section></section> : <>
     {!workspace ? <section className="welcome">
       <p className="eyebrow">PROJECT ARCHAEOLOGY, AT YOUR PACE</p>
       <h1>Every project leaves<br /><em>a story behind.</em></h1>
@@ -98,6 +125,7 @@ export default function App() {
       {view === "screenshots" ? <section className="library">
         <div className="section-heading"><div><p className="eyebrow">VISUAL EVIDENCE</p><h2>Screenshots</h2></div><button className="quiet" disabled={!!progress || !screenshots.some((f) => !evidenceFor(f) || stale(f, evidenceFor(f)))} onClick={() => void analyse(screenshots.filter((f) => !evidenceFor(f) || stale(f, evidenceFor(f))))}>Analyse unanalysed</button></div>
         <p className="privacy-note">Discovery is local; nothing is uploaded. AI analysis sends only the selected screenshot to OpenAI after confirmation.</p>
+        {missingProvider && <div className="missing-provider" role="status"><div><strong>OpenAI isn't configured yet.</strong><p>Add an API key in Settings to analyse screenshots.</p></div><button className="quiet" onClick={() => setView("settings")}>Open Settings</button></div>}
         {progress && <div className="queue-status" role="status"><span>Analysing screenshots · {progress.done} / {progress.total} complete</span><span>Current: {progress.current || "Saving result"}</span><button className="text-action" onClick={() => { cancelQueue.current = true; }}>Cancel queued work</button></div>}
         {screenshots.length === 0 ? <p className="inventory-empty">Add a screenshot folder and scan sources to populate this library.</p> : <div className="library-layout"><ul className="screenshot-list" aria-label="Discovered screenshots">{screenshots.map((file) => { const item = evidenceFor(file); const isStale = stale(file, item); const state = analysisStates[file.path]; return <li key={file.path}><button className={`screenshot-item ${selectedPath === file.path ? "selected" : ""}`} onClick={() => setSelectedPath(file.path)}><span className="thumb">{file.path === selectedPath && preview ? <img src={preview} alt=""/> : "▧"}</span><span className="shot-meta"><strong>{file.name}</strong><small>{file.modified_at ? new Date(file.modified_at).toLocaleDateString() : "Date unavailable"} · {state ?? (isStale ? "Changed · reanalyse" : item ? item.content_type.replace(/_/g, " ") : "Not analysed")}</small><small>{item && !isStale ? item.description : ""}</small></span></button></li>; })}</ul>
         <article className="evidence-detail">{selected ? <><div className="detail-head"><div><p className="eyebrow">{currentEvidence && !stale(selected, currentEvidence) ? "AI OBSERVATION" : "SOURCE FILE"}</p><h3>{selected.name}</h3><p className="path">{selected.modified_at ? new Date(selected.modified_at).toLocaleString() : "File date unavailable"} · {selected.size_bytes ?? "?"} bytes</p></div><button className="primary" disabled={!!progress} onClick={() => void analyse([selected])}>{currentEvidence && !stale(selected, currentEvidence) ? "Reanalyse" : "Analyse"}</button></div>{preview && <img className="large-preview" src={preview} alt={`Preview of ${selected.name}`}/>}<p className="path detail-path">{selected.path}</p>{currentEvidence && !stale(selected, currentEvidence) ? <><p className="type-label">{currentEvidence.content_type.replace(/_/g, " ").toUpperCase()}</p><p className="description">{currentEvidence.description}</p>{currentEvidence.project_area && <p><strong>Project area</strong><br/>{currentEvidence.project_area}</p>}<EvidenceList title="Visible text" items={currentEvidence.visible_text}/><EvidenceList title="Notable elements" items={currentEvidence.notable_elements}/><EvidenceList title="Possible purpose" items={currentEvidence.possible_purpose}/><EvidenceList title="Possible relevance" items={currentEvidence.possible_story_relevance}/><p className="confidence">Confidence {(currentEvidence.confidence * 100).toFixed(0)}% · {currentEvidence.model.provider} / {currentEvidence.model.model}</p></> : <p className="inventory-empty">{currentEvidence ? "This file changed after analysis. Reanalyse it to refresh its evidence." : "No AI observations yet."}</p>}</> : <p className="inventory-empty">Select a screenshot to inspect its source facts and evidence.</p>}</article></div>}
@@ -123,6 +151,7 @@ export default function App() {
       </section>
       <footer className="workspace-footer"><div className="scan-info">{latestScan ? <>Last scanned <time>{new Date(latestScan).toLocaleString()}</time></> : "Ready to discover your project sources"}<p>Local discovery only — nothing is uploaded.</p></div><button className="primary scan" disabled={busy} onClick={() => void scan()}>{busy ? <><span className="spinner"/> Scanning…</> : <>Scan sources <span>→</span></>}</button></footer>
       </>}
+    </>}
     </>}
     {error && <div className="error" role="alert">{error}<button onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}
   </main>;
